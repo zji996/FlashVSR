@@ -356,8 +356,15 @@ class FlashVSRTinyPipeline(BasePipeline):
                     LQ_latents = None
                     inner_loop_num = 7
                     for inner_idx in range(inner_loop_num):
+                        start_idx = max(0, inner_idx*4-3)
+                        end_idx = (inner_idx+1)*4-3
                         cur = self.denoising_model().LQ_proj_in.stream_forward(
-                            LQ_video[:, :, max(0, inner_idx*4-3):(inner_idx+1)*4-3, :, :]
+                            self._fetch_lq_clip(
+                                LQ_video,
+                                start_idx,
+                                end_idx,
+                                device=self.device,
+                            )
                         ) if LQ_video is not None else None
                         if cur is None:
                             continue
@@ -372,8 +379,15 @@ class FlashVSRTinyPipeline(BasePipeline):
                     LQ_latents = None
                     inner_loop_num = 2
                     for inner_idx in range(inner_loop_num):
+                        start_idx = cur_process_idx*8+17+inner_idx*4
+                        end_idx = cur_process_idx*8+21+inner_idx*4
                         cur = self.denoising_model().LQ_proj_in.stream_forward(
-                            LQ_video[:, :, cur_process_idx*8+17+inner_idx*4:cur_process_idx*8+21+inner_idx*4, :, :]
+                            self._fetch_lq_clip(
+                                LQ_video,
+                                start_idx,
+                                end_idx,
+                                device=self.device,
+                            )
                         ) if LQ_video is not None else None
                         if cur is None:
                             continue
@@ -404,6 +418,7 @@ class FlashVSRTinyPipeline(BasePipeline):
                     t_mod=self.t_mod,
                     t=self.t,
                     local_range = local_range,
+                    cache_offload_device=self.cache_offload_device,
                 )
 
                 # 更新 latent
@@ -414,14 +429,31 @@ class FlashVSRTinyPipeline(BasePipeline):
             latents = torch.cat(latents_total, dim=2)
 
             # Decode
-            frames = self.TCDecoder.decode_video(latents.transpose(1, 2),parallel=False, show_progress_bar=False, cond=LQ_video[:,:,:LQ_cur_idx,:,:]).transpose(1, 2).mul_(2).sub_(1)
+            cond_frames = self._fetch_lq_clip(
+                LQ_video,
+                0,
+                LQ_cur_idx,
+                device=self.device,
+            )
+            frames = self.TCDecoder.decode_video(
+                latents.transpose(1, 2),
+                parallel=False,
+                show_progress_bar=False,
+                cond=cond_frames,
+            ).transpose(1, 2).mul_(2).sub_(1)
 
             # 颜色校正（wavelet）
             try:
                 if color_fix:
+                    style_frames = self._fetch_lq_clip(
+                        LQ_video,
+                        0,
+                        frames.shape[2],
+                        device=frames.device,
+                    )
                     frames = self.ColorCorrector(
-                        frames.to(device=LQ_video.device),
-                        LQ_video[:, :, :frames.shape[2], :, :],
+                        frames,
+                        style_frames,
                         clip_range=(-1, 1),
                         chunk_size=16,
                         method='adain'
@@ -504,10 +536,30 @@ def model_fn_wan_video(
     t_mod : torch.Tensor = None,
     t : torch.Tensor = None,
     local_range: int = 9,
+    cache_offload_device: Optional[str] = None,
     **kwargs,
 ):
     # patchify
     x, (f, h, w) = dit.patchify(x)
+    compute_device = x.device
+
+    def _prepare_cache(cache_list, idx):
+        if cache_list is None:
+            return None
+        tensor = cache_list[idx]
+        if tensor is None:
+            return None
+        if tensor.device == compute_device:
+            return tensor
+        return tensor.to(compute_device, non_blocking=False)
+
+    def _offload_cache(tensor):
+        if tensor is None or cache_offload_device is None:
+            return tensor
+        if tensor.device == cache_offload_device:
+            return tensor
+        non_blocking = cache_offload_device != "cpu"
+        return tensor.to(cache_offload_device, non_blocking=non_blocking)
 
     win = (2, 8, 8)
     seqlen = f // win[0]
@@ -550,6 +602,8 @@ def model_fn_wan_video(
         for block_id, block in enumerate(dit.blocks):
             if LQ_latents is not None and block_id < len(LQ_latents):
                 x = x + LQ_latents[block_id]
+            cache_k = _prepare_cache(pre_cache_k, block_id) if pre_cache_k is not None else None
+            cache_v = _prepare_cache(pre_cache_v, block_id) if pre_cache_v is not None else None
             x, last_pre_cache_k, last_pre_cache_v = block(
                 x, context, t_mod, freqs, f, h, w,
                 local_num, topk,
@@ -557,12 +611,12 @@ def model_fn_wan_video(
                 kv_len=kv_len,
                 is_full_block=is_full_block,
                 is_stream=is_stream,
-                pre_cache_k=pre_cache_k[block_id] if pre_cache_k is not None else None,
-                pre_cache_v=pre_cache_v[block_id] if pre_cache_v is not None else None,
+                pre_cache_k=cache_k,
+                pre_cache_v=cache_v,
                 local_range = local_range,
             )
-            if pre_cache_k is not None: pre_cache_k[block_id] = last_pre_cache_k
-            if pre_cache_v is not None: pre_cache_v[block_id] = last_pre_cache_v
+            if pre_cache_k is not None: pre_cache_k[block_id] = _offload_cache(last_pre_cache_k)
+            if pre_cache_v is not None: pre_cache_v[block_id] = _offload_cache(last_pre_cache_v)
 
     x = dit.head(x, t)
     if use_unified_sequence_parallel:

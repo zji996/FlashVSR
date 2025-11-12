@@ -2,6 +2,7 @@ import torch
 import numpy as np
 from PIL import Image
 from torchvision.transforms import GaussianBlur
+from typing import Optional
 
 
 
@@ -15,6 +16,7 @@ class BasePipeline(torch.nn.Module):
         self.width_division_factor = width_division_factor
         self.cpu_offload = False
         self.model_names = []
+        self.cache_offload_device: Optional[str] = None
 
 
     def check_resize_height_width(self, height, width):
@@ -90,6 +92,63 @@ class BasePipeline(torch.nn.Module):
     
     def enable_cpu_offload(self):
         self.cpu_offload = True
+
+    def set_cache_offload_device(self, device: Optional[str] = "cpu"):
+        """
+        Control where streamed KV caches live between steps.
+        None keeps them on the compute device, while 'cpu' spills them to host RAM.
+        """
+        self.cache_offload_device = device
+
+    def _fetch_lq_clip(
+        self,
+        lq_video,
+        start: int,
+        end: int,
+        *,
+        device: Optional[str] = None,
+        dtype: Optional[torch.dtype] = None,
+        non_blocking: bool = True,
+    ):
+        """
+        Retrieve an LQ frame slice either from an in-memory tensor or a lazy backend.
+        """
+        if lq_video is None:
+            return None
+
+        device = device or self.device
+        dtype = dtype or self.torch_dtype
+
+        if hasattr(lq_video, "get_clip"):
+            return lq_video.get_clip(
+                start,
+                end,
+                device=device,
+                dtype=dtype,
+                non_blocking=non_blocking,
+            )
+
+        start = max(start, 0)
+        end = min(end, lq_video.shape[2])
+        if end <= start:
+            return lq_video[:, :, start:start, :, :].to(device=device, dtype=dtype)
+        clip = lq_video[:, :, start:end, :, :]
+        return clip.to(device=device, dtype=dtype, non_blocking=non_blocking)
+
+    def _release_lq_frames(self, lq_video, upto: int) -> None:
+        """
+        Hint the LQ provider that frames prior to `upto` are no longer needed.
+        Streaming backends can use this to free host RAM.
+        """
+        if lq_video is None:
+            return
+        release_cb = getattr(lq_video, "release_until", None)
+        if release_cb is None:
+            return
+        try:
+            release_cb(upto)
+        except Exception:
+            pass
 
 
     def load_models_to_device(self, loadmodel_names=[]):
