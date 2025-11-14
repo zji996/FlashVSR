@@ -13,7 +13,7 @@ from tqdm import tqdm
 # import pyfiglet
 
 from ..models import ModelManager
-from ..models.wan_video_dit import WanModel, RMSNorm, sinusoidal_embedding_1d
+from ..models.wan_video_dit import WanModel, RMSNorm, sinusoidal_embedding_1d, build_3d_freqs
 from ..models.wan_video_vae import WanVideoVAE, RMS_norm, CausalConv3d, Upsample
 from ..schedulers.flow_match import FlowMatchScheduler
 from .base import BasePipeline
@@ -223,6 +223,47 @@ class FlashVSRTinyLongPipeline(BasePipeline):
     def denoising_model(self):
         return self.dit
 
+    # ---- Pipeline parallel placement ----
+    def enable_pipeline_parallel(self, devices: list[str], split_index: Optional[int] = None):
+        super().enable_pipeline_parallel(devices, split_index)
+        if not devices or len(devices) < 2:
+            return self
+        dev0 = devices[0]
+        dev1 = devices[-1]
+        # Default split at middle if not provided
+        if split_index is None:
+            split_index = len(self.dit.blocks) // 2 - 1
+            split_index = max(0, min(split_index, len(self.dit.blocks) - 2))
+        self.pp_split_idx = split_index
+        # Move patch embedding to first stage, head to last stage
+        try:
+            self.dit.patch_embedding.to(dev0)
+        except Exception:
+            pass
+        try:
+            self.dit.head.to(dev1)
+        except Exception:
+            pass
+        # Place blocks and migrate cross-attn KV caches if present
+        for i, blk in enumerate(self.dit.blocks):
+            target = dev0 if i <= split_index else dev1
+            try:
+                blk.to(target)
+            except Exception:
+                pass
+            # Move persistent cross-attention cache to the same device
+            try:
+                ca = blk.cross_attn
+                if hasattr(ca, "cache_k") and ca.cache_k is not None:
+                    ca.cache_k = ca.cache_k.to(target)
+                if hasattr(ca, "cache_v") and ca.cache_v is not None:
+                    ca.cache_v = ca.cache_v.to(target)
+            except Exception:
+                pass
+        # Keep pipeline default device as first stage for VAE and utilities
+        self.device = dev0
+        return self
+
     # -------------------------
     # 新增：显式 KV 预初始化函数
     # -------------------------
@@ -363,6 +404,310 @@ class FlashVSRTinyLongPipeline(BasePipeline):
         frames_total = [] if frame_chunk_handler is None else None
 
         with torch.no_grad():
+            # Overlapped two-stage schedule (single-video acceleration)
+            use_overlap = (
+                self.pp_overlap and self.pp_devices is not None and isinstance(self.pp_devices, (list, tuple)) and len(self.pp_devices) >= 2
+            )
+            if use_overlap:
+                dev0, dev1 = self.pp_devices[0], self.pp_devices[-1]
+                # Dedicated copy stream on dev1 so activation copies don't block compute stream
+                try:
+                    copy_stream_dev1 = torch.cuda.Stream(device=torch.device(dev1))
+                except Exception:
+                    copy_stream_dev1 = None
+
+                # helpers: run a range of DiT blocks; adapted from model_fn_wan_video
+                def _run_blocks_range(x_tokens, context, t_mod_dev, freqs_dev, f, h, w,
+                                      local_num, topk, kv_len, is_full_block, is_stream,
+                                      block_start, block_end,
+                                      pre_cache_k, pre_cache_v,
+                                      LQ_latents_for_win):
+                    compute_device = x_tokens.device
+                    win = (2, 8, 8)
+                    seqlen = f // win[0]
+                    window_size = win[0] * h * w // 128
+                    # loop over specified blocks
+                    for block_id in range(block_start, block_end + 1):
+                        block = self.dit.blocks[block_id]
+                        # device guard
+                        try:
+                            p = next(block.parameters())
+                            if p.device != compute_device:
+                                block.to(compute_device)
+                        except StopIteration:
+                            pass
+                        # LQ latent addend
+                        if LQ_latents_for_win is not None and block_id < len(LQ_latents_for_win):
+                            addend = LQ_latents_for_win[block_id]
+                            if addend.device != x_tokens.device:
+                                addend = addend.to(x_tokens.device, non_blocking=True)
+                            x_tokens = x_tokens + addend
+                        # caches
+                        def _prepare_cache(cache_list, idx):
+                            if cache_list is None:
+                                return None
+                            tensor = cache_list[idx]
+                            if tensor is None:
+                                return None
+                            if tensor.device == compute_device:
+                                return tensor
+                            return tensor.to(compute_device, non_blocking=False)
+                        def _offload_cache(tensor):
+                            if tensor is None or self.cache_offload_device is None:
+                                return tensor
+                            if tensor.device == self.cache_offload_device:
+                                return tensor
+                            non_blocking = self.cache_offload_device != "cpu"
+                            return tensor.to(self.cache_offload_device, non_blocking=non_blocking)
+                        cache_k = _prepare_cache(pre_cache_k, block_id) if pre_cache_k is not None else None
+                        cache_v = _prepare_cache(pre_cache_v, block_id) if pre_cache_v is not None else None
+                        # block forward
+                        x_tokens, last_pre_cache_k, last_pre_cache_v = block(
+                            x_tokens, context, t_mod_dev, freqs_dev, f, h, w,
+                            local_num, topk,
+                            block_id=block_id,
+                            kv_len=kv_len,
+                            is_full_block=is_full_block,
+                            is_stream=is_stream,
+                            pre_cache_k=cache_k,
+                            pre_cache_v=cache_v,
+                            local_range = local_range,
+                        )
+                        if pre_cache_k is not None: pre_cache_k[block_id] = _offload_cache(last_pre_cache_k)
+                        if pre_cache_v is not None: pre_cache_v[block_id] = _offload_cache(last_pre_cache_v)
+                    return x_tokens
+
+                # split index
+                if self.pp_split_idx is None:
+                    split_idx = len(self.dit.blocks) // 2 - 1
+                    split_idx = max(0, min(split_idx, len(self.dit.blocks) - 2))
+                else:
+                    split_idx = self.pp_split_idx
+
+                pre_cache_k = [None] * len(self.dit.blocks)
+                pre_cache_v = [None] * len(self.dit.blocks)
+                pending = None  # holds tuple for previous window
+
+                for cur_process_idx in tqdm(range(process_total_num)):
+                    # Build LQ_latents and current latents (dev0)
+                    if cur_process_idx == 0:
+                        pre_cache_k = [None] * len(self.dit.blocks)
+                        pre_cache_v = [None] * len(self.dit.blocks)
+                        LQ_latents = None
+                        inner_loop_num = 7
+                        for inner_idx in range(inner_loop_num):
+                            start_idx = max(0, inner_idx*4-3)
+                            end_idx = (inner_idx+1)*4-3
+                            cur = self.denoising_model().LQ_proj_in.stream_forward(
+                                self._fetch_lq_clip(
+                                    LQ_video,
+                                    start_idx,
+                                    end_idx,
+                                    device=self.device,
+                                )
+                            ) if LQ_video is not None else None
+                            if cur is None:
+                                continue
+                            if LQ_latents is None:
+                                LQ_latents = cur
+                            else:
+                                for layer_idx in range(len(LQ_latents)):
+                                    LQ_latents[layer_idx] = torch.cat([LQ_latents[layer_idx], cur[layer_idx]], dim=1)
+                        LQ_cur_idx = (inner_loop_num-1)*4-3
+                        cur_latents = latents[:, :, :6, :, :]
+                    else:
+                        LQ_latents = None
+                        inner_loop_num = 2
+                        for inner_idx in range(inner_loop_num):
+                            start_idx = cur_process_idx*8+17+inner_idx*4
+                            end_idx = cur_process_idx*8+21+inner_idx*4
+                            cur = self.denoising_model().LQ_proj_in.stream_forward(
+                                self._fetch_lq_clip(
+                                    LQ_video,
+                                    start_idx,
+                                    end_idx,
+                                    device=self.device,
+                                )
+                            ) if LQ_video is not None else None
+                            if cur is None:
+                                continue
+                            if LQ_latents is None:
+                                LQ_latents = cur
+                            else:
+                                for layer_idx in range(len(LQ_latents)):
+                                    LQ_latents[layer_idx] = torch.cat([LQ_latents[layer_idx], cur[layer_idx]], dim=1)
+                        LQ_cur_idx = cur_process_idx*8+21+(inner_loop_num-2)*4
+                        cur_latents = latents[:, :, 4+cur_process_idx*2:6+cur_process_idx*2, :, :]
+
+                    # patchify and RoPE per-device for this window
+                    x_tokens, (f, h, w) = self.dit.patchify(cur_latents)
+                    # pre-stage freqs/t_mod per device（使用统一的 3D RoPE 构造，避免维度漂移）
+                    head_dim = self.dit.blocks[0].self_attn.head_dim
+                    if cur_process_idx == 0:
+                        freqs_cpu, self.dit.freqs = build_3d_freqs(
+                            getattr(self.dit, "freqs", None),
+                            head_dim=head_dim,
+                            f=f,
+                            h=h,
+                            w=w,
+                            device="cpu",
+                            f_offset=0,
+                        )
+                    else:
+                        freqs_cpu, self.dit.freqs = build_3d_freqs(
+                            getattr(self.dit, "freqs", None),
+                            head_dim=head_dim,
+                            f=f,
+                            h=h,
+                            w=w,
+                            device="cpu",
+                            f_offset=4 + cur_process_idx * 2,
+                        )
+                    freqs_dev0 = freqs_cpu.to(dev0, non_blocking=True)
+                    freqs_dev1 = freqs_cpu.to(dev1, non_blocking=True)
+                    t_mod_dev0 = self.t_mod.to(dev0, non_blocking=True)
+                    t_mod_dev1 = self.t_mod.to(dev1, non_blocking=True)
+
+                    # set scheduling params for this window
+                    win = (2, 8, 8)
+                    seqlen = f // win[0]
+                    local_num = seqlen
+                    window_size = win[0] * h * w // 128
+                    square_num = window_size * window_size
+                    topk = int(square_num * topk_ratio) - 1
+                    kv_len = int(kv_ratio)
+
+                    # ensure tokens on dev0
+                    if str(x_tokens.device) != str(torch.device(dev0)):
+                        x_tokens = x_tokens.to(dev0, non_blocking=True)
+                    # If we have a pending window, finish its Stage1 now on dev1 first,
+                    # then immediately start Stage0 for the current window on dev0 to overlap.
+                    if pending is not None:
+                        (prev_idx, prev_x_mid_dev1, prev_LQ_latents, prev_f, prev_h, prev_w,
+                         prev_freqs_dev1, prev_t_mod_dev1, prev_cur_latents, prev_LQ_pre_idx, prev_LQ_cur_idx) = pending
+                        # Stage1 for previous window
+                        x_tail = _run_blocks_range(
+                            prev_x_mid_dev1, None, prev_t_mod_dev1, prev_freqs_dev1,
+                            prev_f, prev_h, prev_w,
+                            local_num, topk, kv_len, is_full_block, True,
+                            split_idx+1, len(self.dit.blocks)-1, pre_cache_k, pre_cache_v, prev_LQ_latents)
+                        # head + unpatchify on dev1
+                        # ensure head on dev1
+                        try:
+                            if next(self.dit.head.parameters()).device != torch.device(dev1):
+                                self.dit.head.to(dev1)
+                        except StopIteration:
+                            pass
+                        noise_pred_posi_prev = self.dit.head(x_tail, self.t.to(device=dev1, non_blocking=True))
+                        noise_pred_posi_prev = self.dit.unpatchify(noise_pred_posi_prev, (prev_f, prev_h, prev_w))
+                        # Update latent for previous window on GPU1; defer decode to after Stage0 scheduling
+                        prev_latents_dev1 = prev_cur_latents.to(dev1, non_blocking=True)
+                        prev_latents_dev1 = prev_latents_dev1 - noise_pred_posi_prev
+
+                    # Immediately schedule Stage0 on dev0 for current window to maximize overlap
+                    if str(x_tokens.device) != str(torch.device(dev0)):
+                        x_tokens = x_tokens.to(dev0, non_blocking=True)
+                    x_mid = _run_blocks_range(
+                        x_tokens, None, t_mod_dev0, freqs_dev0, f, h, w,
+                        local_num, topk, kv_len, is_full_block, True,
+                        0, split_idx, pre_cache_k, pre_cache_v, LQ_latents)
+                    if copy_stream_dev1 is not None:
+                        with torch.cuda.stream(copy_stream_dev1):
+                            x_mid_dev1 = x_mid.to(dev1, non_blocking=True)
+                    else:
+                        x_mid_dev1 = x_mid.to(dev1, non_blocking=True)
+
+                    # Now finish decode/color/cpu-copy for the previous window (on GPU1)
+                    if pending is not None:
+                        cur_LQ_frame = self._fetch_lq_clip(
+                            LQ_video,
+                            prev_LQ_pre_idx,
+                            prev_LQ_cur_idx,
+                            device=dev1,
+                        )
+                        cur_frames = self.TCDecoder.decode_video(
+                            prev_latents_dev1.transpose(1, 2),
+                            parallel=False,
+                            show_progress_bar=False,
+                            cond=cur_LQ_frame,
+                        ).transpose(1, 2).mul_(2).sub_(1)
+                        try:
+                            if color_fix:
+                                cur_frames = self.ColorCorrector(
+                                    cur_frames,
+                                    cur_LQ_frame,
+                                    clip_range=(-1, 1),
+                                    method='wavelet',
+                                    chunk_size=color_chunk_size,
+                                )
+                        except Exception:
+                            pass
+                        cpu_chunk = cur_frames.to('cpu')
+                        if frame_chunk_handler is None:
+                            frames_total.append(cpu_chunk)
+                        else:
+                            frame_chunk_handler(cpu_chunk)
+                        self._release_lq_frames(LQ_video, prev_LQ_cur_idx)
+                        LQ_pre_idx = prev_LQ_cur_idx
+
+                    # set new pending window (current) to be finished next iter
+                    pending = (cur_process_idx, x_mid_dev1, LQ_latents, f, h, w,
+                               freqs_dev1, t_mod_dev1, cur_latents, LQ_pre_idx, LQ_cur_idx)
+
+                # flush tail: finish last pending window Stage1
+                if pending is not None:
+                    (prev_idx, prev_x_mid_dev1, prev_LQ_latents, prev_f, prev_h, prev_w,
+                     prev_freqs_dev1, prev_t_mod_dev1, prev_cur_latents, prev_LQ_pre_idx, prev_LQ_cur_idx) = pending
+                    x_tail = _run_blocks_range(
+                        prev_x_mid_dev1, None, prev_t_mod_dev1, prev_freqs_dev1,
+                        prev_f, prev_h, prev_w,
+                        local_num, topk, kv_len, is_full_block, True,
+                        split_idx+1, len(self.dit.blocks)-1, pre_cache_k, pre_cache_v, prev_LQ_latents)
+                    try:
+                        if next(self.dit.head.parameters()).device != torch.device(dev1):
+                            self.dit.head.to(dev1)
+                    except StopIteration:
+                        pass
+                    noise_pred_posi_prev = self.dit.head(x_tail, self.t.to(device=dev1, non_blocking=True))
+                    noise_pred_posi_prev = self.dit.unpatchify(noise_pred_posi_prev, (prev_f, prev_h, prev_w))
+                    # Keep computation on dev1
+                    prev_latents_dev1 = prev_cur_latents.to(dev1, non_blocking=True)
+                    prev_latents_dev1 = prev_latents_dev1 - noise_pred_posi_prev
+                    cur_LQ_frame = self._fetch_lq_clip(
+                        LQ_video,
+                        prev_LQ_pre_idx,
+                        prev_LQ_cur_idx,
+                        device=dev1,
+                    )
+                    cur_frames = self.TCDecoder.decode_video(
+                        prev_latents_dev1.transpose(1, 2),
+                        parallel=False,
+                        show_progress_bar=False,
+                        cond=cur_LQ_frame,
+                    ).transpose(1, 2).mul_(2).sub_(1)
+                    try:
+                        if color_fix:
+                            cur_frames = self.ColorCorrector(
+                                cur_frames,
+                                cur_LQ_frame,
+                                clip_range=(-1, 1),
+                                method='wavelet',
+                                chunk_size=color_chunk_size,
+                            )
+                    except Exception:
+                        pass
+                    if frame_chunk_handler is None:
+                        frames_total.append(cur_frames.to('cpu'))
+                    else:
+                        frame_chunk_handler(cur_frames.to('cpu'))
+                    self._release_lq_frames(LQ_video, prev_LQ_cur_idx)
+                # concat frames if needed
+                if frame_chunk_handler is not None:
+                    return None
+                frames_cat = torch.cat(frames_total, dim=2) if len(frames_total) > 0 else None
+                return frames_cat[0] if frames_cat is not None else None
+
+            # Non-overlap path (default)
             for cur_process_idx in tqdm(range(process_total_num)):
                 if cur_process_idx == 0:
                     pre_cache_k = [None] * len(self.dit.blocks)
@@ -433,6 +778,8 @@ class FlashVSRTinyLongPipeline(BasePipeline):
                     t=self.t,
                     local_range = local_range,
                     cache_offload_device=self.cache_offload_device,
+                    pp_devices=self.pp_devices,
+                    pp_split_idx=self.pp_split_idx,
                 )
 
                 # 更新 latent
@@ -552,11 +899,14 @@ def model_fn_wan_video(
     t : torch.Tensor = None,
     local_range: int = 9,
     cache_offload_device: Optional[str] = None,
+    pp_devices: Optional[list[str]] = None,
+    pp_split_idx: Optional[int] = None,
     **kwargs,
 ):
     # patchify
     x, (f, h, w) = dit.patchify(x)
     compute_device = x.device
+    origin_device = x.device
 
     def _prepare_cache(cache_list, idx):
         if cache_list is None:
@@ -584,19 +934,43 @@ def model_fn_wan_video(
     topk = int(square_num * topk_ratio) - 1
     kv_len = int(kv_ratio)
 
-    # RoPE 位置（分段）
+    # RoPE 位置（分段），并预先在两个设备上各保存一份以避免每层重复搬运
+    head_dim = dit.blocks[0].self_attn.head_dim
     if cur_process_idx == 0:
-        freqs = torch.cat([
-            dit.freqs[0][:f].view(f, 1, 1, -1).expand(f, h, w, -1),
-            dit.freqs[1][:h].view(1, h, 1, -1).expand(f, h, w, -1),
-            dit.freqs[2][:w].view(1, 1, w, -1).expand(f, h, w, -1)
-        ], dim=-1).reshape(f * h * w, 1, -1).to(x.device)
+        freqs_cpu, dit.freqs = build_3d_freqs(
+            getattr(dit, "freqs", None),
+            head_dim=head_dim,
+            f=f,
+            h=h,
+            w=w,
+            device="cpu",
+            f_offset=0,
+        )
     else:
-        freqs = torch.cat([
-            dit.freqs[0][4 + cur_process_idx*2:4 + cur_process_idx*2 + f].view(f, 1, 1, -1).expand(f, h, w, -1),
-            dit.freqs[1][:h].view(1, h, 1, -1).expand(f, h, w, -1),
-            dit.freqs[2][:w].view(1, 1, w, -1).expand(f, h, w, -1)
-        ], dim=-1).reshape(f * h * w, 1, -1).to(x.device)
+        freqs_cpu, dit.freqs = build_3d_freqs(
+            getattr(dit, "freqs", None),
+            head_dim=head_dim,
+            f=f,
+            h=h,
+            w=w,
+            device="cpu",
+            f_offset=4 + cur_process_idx * 2,
+        )
+    # Default single-device
+    freqs = freqs_cpu.to(x.device, non_blocking=True)
+    # If pp enabled, pre-stage on both devices
+    freqs_dev0 = freqs
+    freqs_dev1 = None
+    t_mod_dev0 = t_mod
+    t_mod_dev1 = None
+    if pp_devices is not None and isinstance(pp_devices, (list, tuple)) and len(pp_devices) >= 2:
+        dev0, dev1 = pp_devices[0], pp_devices[-1]
+        if str(torch.device(dev0)) != str(freqs.device):
+            freqs_dev0 = freqs_cpu.to(dev0, non_blocking=True)
+        freqs_dev1 = freqs_cpu.to(dev1, non_blocking=True) if str(torch.device(dev1)) != str(freqs.device) else freqs
+        # pre-stage time modulation
+        t_mod_dev0 = t_mod.to(dev0, non_blocking=True) if str(torch.device(dev0)) != str(t_mod.device) else t_mod
+        t_mod_dev1 = t_mod.to(dev1, non_blocking=True) if str(torch.device(dev1)) != str(t_mod.device) else t_mod
 
     # TeaCache（默认不启用）
     tea_cache_update = tea_cache.check(dit, x, t_mod) if tea_cache is not None else False
@@ -610,17 +984,48 @@ def model_fn_wan_video(
         if dist.is_initialized() and dist.get_world_size() > 1:
             x = torch.chunk(x, get_sequence_parallel_world_size(), dim=1)[get_sequence_parallel_rank()]
 
+    # Pipeline-parallel planning (optional)
+    pp_enabled = pp_devices is not None and isinstance(pp_devices, (list, tuple)) and len(pp_devices) >= 2
+    if pp_enabled:
+        dev0, dev1 = pp_devices[0], pp_devices[-1]
+        if pp_split_idx is None:
+            pp_split_idx = len(dit.blocks) // 2 - 1
+            pp_split_idx = max(0, min(pp_split_idx, len(dit.blocks) - 2))
+
     # Block 堆叠
     if tea_cache_update:
         x = tea_cache.update(x)
     else:
         for block_id, block in enumerate(dit.blocks):
+            # Select device for this block if pp is enabled
+            if pp_enabled:
+                target_device = dev0 if block_id <= pp_split_idx else dev1
+                if str(x.device) != str(torch.device(target_device)):
+                    x = x.to(target_device, non_blocking=False)
+                # keep caches / helper tensors on the same device
+                compute_device = x.device
+                # Select pre-staged tensors for this device
+                freqs_cur = freqs_dev0 if str(compute_device) == str(torch.device(dev0)) else (freqs_dev1 if freqs_dev1 is not None else freqs.to(compute_device, non_blocking=True))
+                t_mod_cur = t_mod_dev0 if str(compute_device) == str(torch.device(dev0)) else (t_mod_dev1 if t_mod_dev1 is not None else t_mod.to(compute_device, non_blocking=True))
+                # ensure block is on the right device (fallback safety)
+                try:
+                    p = next(block.parameters())
+                    if p.device != compute_device:
+                        block.to(compute_device)
+                except StopIteration:
+                    pass
+            else:
+                freqs_cur = freqs
+                t_mod_cur = t_mod
             if LQ_latents is not None and block_id < len(LQ_latents):
-                x = x + LQ_latents[block_id]
+                addend = LQ_latents[block_id]
+                if pp_enabled and addend.device != x.device:
+                    addend = addend.to(x.device, non_blocking=False)
+                x = x + addend
             cache_k = _prepare_cache(pre_cache_k, block_id) if pre_cache_k is not None else None
             cache_v = _prepare_cache(pre_cache_v, block_id) if pre_cache_v is not None else None
             x, last_pre_cache_k, last_pre_cache_v = block(
-                x, context, t_mod, freqs, f, h, w,
+                x, context, t_mod_cur, freqs_cur, f, h, w,
                 local_num, topk,
                 block_id=block_id,
                 kv_len=kv_len,
@@ -633,11 +1038,27 @@ def model_fn_wan_video(
             if pre_cache_k is not None: pre_cache_k[block_id] = _offload_cache(last_pre_cache_k)
             if pre_cache_v is not None: pre_cache_v[block_id] = _offload_cache(last_pre_cache_v)
 
-    x = dit.head(x, t)
+    # Final head on the device of last stage when pp is enabled
+    if pp_enabled:
+        last_device = dev1
+        if str(x.device) != str(torch.device(last_device)):
+            x = x.to(last_device, non_blocking=False)
+        try:
+            if next(dit.head.parameters()).device != x.device:
+                dit.head.to(x.device)
+        except StopIteration:
+            pass
+        t = t.to(x.device, non_blocking=False)
+        x = dit.head(x, t)
+    else:
+        x = dit.head(x, t)
     if use_unified_sequence_parallel:
         import torch.distributed as dist
         from xfuser.core.distributed import get_sp_group
         if dist.is_initialized() and dist.get_world_size() > 1:
             x = get_sp_group().all_gather(x, dim=1)
     x = dit.unpatchify(x, (f, h, w))
+    # Move result back to the origin device so caller tensors match
+    if pp_enabled and str(x.device) != str(origin_device):
+        x = x.to(origin_device, non_blocking=False)
     return x, pre_cache_k, pre_cache_v

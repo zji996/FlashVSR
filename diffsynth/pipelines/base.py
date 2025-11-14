@@ -17,6 +17,10 @@ class BasePipeline(torch.nn.Module):
         self.cpu_offload = False
         self.model_names = []
         self.cache_offload_device: Optional[str] = None
+        # Pipeline parallel config (optional)
+        self.pp_devices: Optional[list[str]] = None
+        self.pp_split_idx: Optional[int] = None
+        self.pp_overlap: bool = False
 
 
     def check_resize_height_width(self, height, width):
@@ -99,6 +103,18 @@ class BasePipeline(torch.nn.Module):
         None keeps them on the compute device, while 'cpu' spills them to host RAM.
         """
         self.cache_offload_device = device
+
+    # ---- Pipeline parallel (no-op default) ----
+    def enable_pipeline_parallel(self, devices: list[str], split_index: Optional[int] = None):
+        """Enable pipeline parallelism. Derived pipelines may override to place blocks across devices."""
+        self.pp_devices = list(devices)
+        self.pp_split_idx = split_index
+        return self
+
+    def enable_pipeline_overlap(self, enabled: bool = True):
+        """Enable overlapped scheduling across windows when pipeline parallel is on."""
+        self.pp_overlap = bool(enabled)
+        return self
 
     def _fetch_lq_clip(
         self,

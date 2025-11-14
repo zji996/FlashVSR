@@ -1,10 +1,13 @@
 import torch
 from typing import Optional
 from einops import rearrange
-from xfuser.core.distributed import (get_sequence_parallel_rank,
-                                     get_sequence_parallel_world_size,
-                                     get_sp_group)
+from xfuser.core.distributed import (
+    get_sequence_parallel_rank,
+    get_sequence_parallel_world_size,
+    get_sp_group,
+)
 from xfuser.core.long_ctx_attention import xFuserLongContextAttention
+from ..models.wan_video_dit import build_3d_freqs
 
 def sinusoidal_embedding_1d(dim, position):
     sinusoid = torch.outer(position.type(torch.float64), torch.pow(
@@ -34,8 +37,9 @@ def rope_apply(x, freqs, num_heads):
     sp_size = get_sequence_parallel_world_size()
     sp_rank = get_sequence_parallel_rank()
     freqs = pad_freqs(freqs, s_per_rank * sp_size)
-    freqs_rank = freqs[(sp_rank * s_per_rank):((sp_rank + 1) * s_per_rank), :, :]
-
+    freqs_rank = freqs[
+        (sp_rank * s_per_rank) : ((sp_rank + 1) * s_per_rank), :, :
+    ]
     x_out = torch.view_as_real(x_out * freqs_rank).flatten(2)
     return x_out.to(x.dtype)
 
@@ -60,12 +64,15 @@ def usp_dit_forward(self,
         context = torch.cat([clip_embdding, context], dim=1)
     
     x, (f, h, w) = self.patchify(x)
-    
-    freqs = torch.cat([
-        self.freqs[0][:f].view(f, 1, 1, -1).expand(f, h, w, -1),
-        self.freqs[1][:h].view(1, h, 1, -1).expand(f, h, w, -1),
-        self.freqs[2][:w].view(1, 1, w, -1).expand(f, h, w, -1)
-    ], dim=-1).reshape(f * h * w, 1, -1).to(x.device)
+    head_dim = self.blocks[0].self_attn.head_dim
+    freqs, self.freqs = build_3d_freqs(
+        self.freqs,
+        head_dim=head_dim,
+        f=f,
+        h=h,
+        w=w,
+        device=x.device,
+    )
     
     def create_custom_forward(module):
         def custom_forward(*inputs):

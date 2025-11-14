@@ -13,7 +13,7 @@ from tqdm import tqdm
 # import pyfiglet
 
 from ..models import ModelManager
-from ..models.wan_video_dit import WanModel, RMSNorm, sinusoidal_embedding_1d
+from ..models.wan_video_dit import WanModel, RMSNorm, sinusoidal_embedding_1d, build_3d_freqs
 from ..models.wan_video_vae import WanVideoVAE, RMS_norm, CausalConv3d, Upsample
 from ..schedulers.flow_match import FlowMatchScheduler
 from .base import BasePipeline
@@ -570,18 +570,27 @@ def model_fn_wan_video(
     kv_len = int(kv_ratio)
 
     # RoPE 位置（分段）
+    head_dim = dit.blocks[0].self_attn.head_dim
     if cur_process_idx == 0:
-        freqs = torch.cat([
-            dit.freqs[0][:f].view(f, 1, 1, -1).expand(f, h, w, -1),
-            dit.freqs[1][:h].view(1, h, 1, -1).expand(f, h, w, -1),
-            dit.freqs[2][:w].view(1, 1, w, -1).expand(f, h, w, -1)
-        ], dim=-1).reshape(f * h * w, 1, -1).to(x.device)
+        freqs, dit.freqs = build_3d_freqs(
+            getattr(dit, "freqs", None),
+            head_dim=head_dim,
+            f=f,
+            h=h,
+            w=w,
+            device=x.device,
+            f_offset=0,
+        )
     else:
-        freqs = torch.cat([
-            dit.freqs[0][4 + cur_process_idx*2:4 + cur_process_idx*2 + f].view(f, 1, 1, -1).expand(f, h, w, -1),
-            dit.freqs[1][:h].view(1, h, 1, -1).expand(f, h, w, -1),
-            dit.freqs[2][:w].view(1, 1, w, -1).expand(f, h, w, -1)
-        ], dim=-1).reshape(f * h * w, 1, -1).to(x.device)
+        freqs, dit.freqs = build_3d_freqs(
+            getattr(dit, "freqs", None),
+            head_dim=head_dim,
+            f=f,
+            h=h,
+            w=w,
+            device=x.device,
+            f_offset=4 + cur_process_idx * 2,
+        )
 
     # TeaCache（默认不启用）
     tea_cache_update = tea_cache.check(dit, x, t_mod) if tea_cache is not None else False

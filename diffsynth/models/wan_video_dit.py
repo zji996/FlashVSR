@@ -254,6 +254,71 @@ def precompute_freqs_cis_3d(dim: int, end: int = 1024, theta: float = 10000.0):
     return f_freqs_cis, h_freqs_cis, w_freqs_cis
 
 
+def build_3d_freqs(
+    cached_freqs,
+    head_dim: int,
+    f: int,
+    h: int,
+    w: int,
+    device,
+    base_max_positions: int = 1024,
+    f_offset: int = 0,
+):
+    """
+    Build 3D RoPE freqs for given (f, h, w) and head_dim.
+    If cached_freqs is provided, reuse it when shapes match; otherwise or on
+    mismatch, recompute with a consistent head_dim.
+    """
+    expected_pairs = head_dim // 2
+    max_f_needed = f_offset + f
+
+    if cached_freqs is not None:
+        f_freqs_cis, h_freqs_cis, w_freqs_cis = cached_freqs
+        pairs_sum = (
+            f_freqs_cis.shape[-1]
+            + h_freqs_cis.shape[-1]
+            + w_freqs_cis.shape[-1]
+        )
+        need_rebuild = (
+            pairs_sum != expected_pairs
+            or f_freqs_cis.size(0) < max_f_needed
+            or h_freqs_cis.size(0) < h
+            or w_freqs_cis.size(0) < w
+        )
+        max_pos = max(
+            base_max_positions,
+            f_freqs_cis.size(0),
+            h_freqs_cis.size(0),
+            w_freqs_cis.size(0),
+            max_f_needed,
+            h,
+            w,
+        )
+    else:
+        need_rebuild = True
+        max_pos = max(base_max_positions, max_f_needed, h, w)
+
+    if need_rebuild:
+        f_freqs_cis, h_freqs_cis, w_freqs_cis = precompute_freqs_cis_3d(
+            head_dim, end=max_pos
+        )
+        cached_freqs = (f_freqs_cis, h_freqs_cis, w_freqs_cis)
+    else:
+        f_freqs_cis, h_freqs_cis, w_freqs_cis = cached_freqs
+
+    freqs = torch.cat(
+        [
+            f_freqs_cis[f_offset : f_offset + f]
+            .view(f, 1, 1, -1)
+            .expand(f, h, w, -1),
+            h_freqs_cis[:h].view(1, h, 1, -1).expand(f, h, w, -1),
+            w_freqs_cis[:w].view(1, 1, w, -1).expand(f, h, w, -1),
+        ],
+        dim=-1,
+    ).reshape(f * h * w, 1, -1)
+    return freqs.to(device), cached_freqs
+
+
 def precompute_freqs_cis(dim: int, end: int = 1024, theta: float = 10000.0):
     freqs = 1.0 / (theta ** (torch.arange(0, dim, 2)
                    [: (dim // 2)].double() / dim))
@@ -643,11 +708,15 @@ class WanModel(torch.nn.Module):
         decay_ratio = random.uniform(0.7, 1.0)
 
         # RoPE 3D
-        freqs = torch.cat([
-            self.freqs[0][:f].view(f, 1, 1, -1).expand(f, h, w, -1),
-            self.freqs[1][:h].view(1, h, 1, -1).expand(f, h, w, -1),
-            self.freqs[2][:w].view(1, 1, w, -1).expand(f, h, w, -1)
-        ], dim=-1).reshape(f * h * w, 1, -1).to(x.device)
+        head_dim = self.blocks[0].self_attn.head_dim
+        freqs, self.freqs = build_3d_freqs(
+            self.freqs,
+            head_dim=head_dim,
+            f=f,
+            h=h,
+            w=w,
+            device=x.device,
+        )
 
         def create_custom_forward(module):
             def custom_forward(*inputs):
